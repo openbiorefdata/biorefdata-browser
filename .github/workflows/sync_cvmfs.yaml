@@ -34,7 +34,19 @@ jobs:
       - id: mount_cvmfs
         run: /app/mount.sh
       - id: set-matrix
-        run: echo "::set-output name=path-matrix::$(/app/matrix.sh)"
+        shell: bash
+        run: |
+          paths="$(/app/matrix.sh)"
+          n="$(printf '%s' "$paths" | jq 'length')"
+          # A GitHub Actions matrix generates at most 256 jobs per run. There are
+          # more sync paths than that, so batch them: pick the smallest batch size
+          # that keeps the job count <= 200, then emit one space-joined path list
+          # per batch. The mirror job loops over the paths within its batch.
+          size="$(( (n + 199) / 200 ))"
+          [ "$size" -lt 1 ] && size=1
+          matrix="$(printf '%s' "$paths" | jq -c --argjson s "$size" \
+            '[range(0; length; $s) as $i | .[$i:$i+$s] | join(" ")]')"
+          printf 'path-matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
       - name: Show matrix
         run: echo "The matrix is ${{ steps.set-matrix.outputs.path-matrix }}"
     outputs:
@@ -45,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        path: ${{ fromJson(needs.build-dynamic-matrix.outputs.path-matrix) }}
+        chunk: ${{ fromJson(needs.build-dynamic-matrix.outputs.path-matrix) }}
     container:
       image: cloudve/mirror_cvmfs_s3:latest
       env:
@@ -57,5 +69,22 @@ jobs:
       options: --privileged
     steps:
       - name: Run mirroring script within container
+        shell: bash
         run: |
-          /app/sync.sh ${{ matrix.path }}
+          # Each matrix entry is a space-separated batch of paths. sync.sh handles
+          # one path and (re)mounts s3fs on /opt/s3fs itself, so unmount any stale
+          # mount between paths to keep each mount clean. Keep going if one path
+          # fails (matches fail-fast: false) and fail the job if any path failed.
+          status=0
+          for path in ${{ matrix.chunk }}; do
+            echo "::group::Mirroring ${path}"
+            if mountpoint -q /opt/s3fs; then
+              fusermount -u /opt/s3fs || umount -l /opt/s3fs
+            fi
+            if ! /app/sync.sh "${path}"; then
+              echo "::error::sync failed for ${path}"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${status}"
